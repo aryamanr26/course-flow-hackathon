@@ -56,26 +56,29 @@ function getMessageText(msg: UIMessage): string {
 }
 
 function convertToOciMessages(messages: UIMessage[]): Array<{ role: string; content: Array<{ type: string; text?: string }> }> {
-  // Match working script (oci-chat-test.ts): single USER message, uppercase role.
-  // Send only the latest user message with system prompt so we avoid "Model input cannot be empty".
-  const userMessages = messages.filter((m) => m.role === 'user')
-  const lastUser = userMessages[userMessages.length - 1]
-  if (!lastUser) return []
+  const ociMessages: Array<{
+    role: string
+    content: Array<{ type: string; text?: string }>
+  }> = []
 
-  const text = getMessageText(lastUser)?.trim() ?? ''
-  if (!text) return []
+  // Always include system prompt at the top (student profile + guidelines)
+  ociMessages.push({
+    role: 'SYSTEM',
+    content: [{ type: 'TEXT', text: systemPrompt }],
+  })
 
-  const contentText =
-    userMessages.length === 1
-      ? `${systemPrompt}\n\n---\n\n${text}`
-      : text
+  for (const msg of messages) {
+    if (msg.role === 'system') continue // already have SYSTEM above
+    const text = getMessageText(msg)?.trim()
+    if (!text) continue
 
-  return [
-    {
-      role: 'USER',
-      content: [{ type: 'TEXT', text: contentText }],
-    },
-  ]
+    ociMessages.push({
+      role: msg.role.toUpperCase(), // USER or ASSISTANT
+      content: [{ type: 'TEXT', text }],
+    })
+  }
+
+  return ociMessages
 }
 
 export async function POST(req: Request) {
