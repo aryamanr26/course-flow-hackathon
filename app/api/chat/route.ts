@@ -5,6 +5,7 @@ import {
   ConfigFileAuthenticationDetailsProvider,
   NoRetryConfigurationDetails,
 } from 'oci-common'
+import * as serpapi from 'serpapi'
 import {
   studentProfile,
   availableCourses,
@@ -46,7 +47,8 @@ ${studentProfile.completedCourses.map(c => `- ${c.code}: ${c.name} (${c.grade})`
 - Give concrete, actionable advice about which courses to take and when.
 - Consider workload balance when suggesting multiple courses together.
 - Keep responses concise but thorough.
-- When the student asks for a list of all courses or what's available, you will receive the full catalog in the context below—use it to answer. When they ask about a specific course, you will receive prerequisites, ratings, and reviews in the context below.`
+- When the student asks for a list of all courses or what's available, you will receive the full catalog in the context below—use it to answer. When they ask about a specific course, you will receive prerequisites, ratings, and reviews in the context below.
+- If you don't have information about something outside the course catalog (like current events, recent news, or external information), you can request a web search by saying "I need to search for more information about [topic]". The system will perform a Google search and provide you with the results.`
 
 // AI SDK useChat sends messages with `parts` (not content)
 type UIMessage = {
@@ -199,6 +201,117 @@ function isAskingAboutCalendar(text: string): boolean {
   )
 }
 
+async function performGoogleSearch(query: string): Promise<string> {
+  // Next.js reads from .env.local or environment variables
+  const serpApiKey = process.env.SERPAPI_KEY || process.env.NEXT_PUBLIC_SERPAPI_KEY
+  if (!serpApiKey) {
+    console.warn('SERPAPI_KEY not set. Available env vars:', Object.keys(process.env).filter(k => k.includes('SERP')))
+    return 'Search unavailable: API key not configured. Please set SERPAPI_KEY in .env.local or export it before starting the server.'
+  }
+
+  try {
+    const results = await serpapi.getJson({
+      engine: 'google',
+      q: query,
+      api_key: serpApiKey,
+      num: 5, // Get top 5 results
+    })
+
+    const organicResults = results.organic_results || []
+    if (organicResults.length === 0) {
+      return 'No search results found.'
+    }
+
+    const formattedResults = organicResults
+      .map((result: any, idx: number) => {
+        return `${idx + 1}. ${result.title || 'Untitled'}
+   URL: ${result.link || 'N/A'}
+   ${result.snippet || result.about_this_result?.text || 'No description available'}`
+      })
+      .join('\n\n')
+
+    return `## Google Search Results for: "${query}"
+
+${formattedResults}`
+  } catch (error) {
+    console.error('Search error:', error)
+    return `Search failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+  }
+}
+
+function needsWebSearch(text: string): boolean {
+  const lower = text.toLowerCase()
+  // Explicit search requests
+  if (
+    /\b(search|google|look up|find information about)\b/.test(lower) ||
+    /\bneed (more )?information (on|about|regarding)\b/.test(lower) ||
+    /\bwhat is\b.*\b(current|recent|latest|news|today)\b/.test(lower) ||
+    /\bwhat are\b.*\b(current|recent|latest|news|today)\b/.test(lower) ||
+    /\bwhat's\b.*\b(current|recent|latest|news|today)\b/.test(lower) ||
+    /\bwhen did\b/.test(lower) ||
+    /\bwho is\b/.test(lower) ||
+    /\bhow much does\b/.test(lower) ||
+    /\b(latest|recent|current|news|today)\b.*\b(news|updates|events)\b/.test(lower) ||
+    /\bAI news\b/.test(lower) ||
+    /\btech news\b/.test(lower) ||
+    /\b(latest|recent|current)\b.*\b(courses|classes|programs)\b/.test(lower)
+  ) {
+    return true
+  }
+  return false
+}
+
+function extractSearchQuery(text: string, assistantResponse?: string): string | null {
+  // If assistant explicitly requests search
+  if (assistantResponse) {
+    const searchMatch = assistantResponse.match(/I need to search for more information about (.+?)(?:\.|\?|$)/i)
+    if (searchMatch) {
+      return searchMatch[1].trim()
+    }
+    // Also check for "search for" patterns
+    const searchForMatch = assistantResponse.match(/search for (.+?)(?:\.|\?|$)/i)
+    if (searchForMatch) {
+      return searchForMatch[1].trim()
+    }
+  }
+
+  // Extract from user's question
+  const lower = text.toLowerCase()
+  
+  // Patterns to extract search queries (order matters - more specific first)
+  const patterns = [
+    /(?:need (?:more )?information (?:on|about|regarding))\s+(.+?)(?:\?|$)/i,
+    /(?:search|google|look up|find information about)\s+(.+?)(?:\?|$)/i,
+    /what is (.+?)(?:\?|$)/i,
+    /what are (.+?)(?:\?|$)/i,
+    /what's (.+?)(?:\?|$)/i,
+    /who is (.+?)(?:\?|$)/i,
+    /when did (.+?)(?:\?|$)/i,
+    /tell me about (.+?)(?:\?|$)/i,
+  ]
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (match && match[1]) {
+      let query = match[1].trim()
+      // Clean up common prefixes
+      query = query.replace(/^(the|a|an)\s+/i, '')
+      return query
+    }
+  }
+
+  // Fallback: use the whole question if it seems like a search query
+  if (needsWebSearch(text)) {
+    // Remove question words and clean up
+    let query = text.replace(/\?$/, '').trim()
+    query = query.replace(/^(i need (more )?information (on|about|regarding)|tell me about|what is|what are|what's|who is|when did|search for|google|look up|find information about)\s+/i, '')
+    query = query.replace(/^(the|a|an)\s+/i, '')
+    return query.trim() || null
+  }
+
+  return null
+}
+
 function buildCalendarContext(): string {
   // Group personal events by day
   const byDay: Record<string, Array<{ title: string; startTime: string; endTime: string; type: string }>> = {}
@@ -322,6 +435,23 @@ export async function POST(req: Request) {
         if (isAskingAboutCalendar(lastUserText)) {
           contextParts.push(buildCalendarContext())
         }
+
+        // Check if web search is needed
+        let searchResults: string | null = null
+        if (needsWebSearch(lastUserText)) {
+          const searchQuery = extractSearchQuery(lastUserText)
+          console.log(`needsWebSearch=true, extracted query: ${searchQuery}`)
+          if (searchQuery) {
+            console.log(`Performing proactive search for: ${searchQuery}`)
+            searchResults = await performGoogleSearch(searchQuery)
+            contextParts.push(searchResults)
+          } else {
+            console.log(`needsWebSearch=true but extractSearchQuery returned null`)
+          }
+        } else {
+          console.log(`needsWebSearch=false for: "${lastUserText}"`)
+        }
+
         const courseContext = contextParts.length > 0 ? contextParts.join('\n\n---\n\n') : undefined
 
         console.log("Context injected:\n", courseContext || '(none)')
@@ -371,6 +501,93 @@ export async function POST(req: Request) {
             .filter((c) => (c.type === 'TEXT' || c.type === 'text') && 'text' in c)
             .map((c) => (c.text ?? '').toString())
             .join('')
+        }
+
+        // Check if assistant is requesting a search (if we didn't already search)
+        if (text && !searchResults) {
+          // Check if assistant is asking to search
+          const isRequestingSearch = /I need to search/i.test(text) || /search for/i.test(text)
+          if (isRequestingSearch) {
+            // Use the original user question as the search query
+            let searchQuery = extractSearchQuery(lastUserText) || lastUserText.replace(/\?$/, '').trim()
+            // Clean up the query
+            searchQuery = searchQuery.replace(/^(i need (more )?information (on|about|regarding)|tell me about|what is|what are|what's)\s+/i, '')
+            searchQuery = searchQuery.replace(/^(the|a|an)\s+/i, '')
+            searchQuery = searchQuery.trim()
+            
+            if (searchQuery && searchQuery.length > 2) {
+              console.log(`Assistant requested search, using query: ${searchQuery}`)
+              
+              // Perform search
+              const followUpSearchResults = await performGoogleSearch(searchQuery)
+              
+              // Continue conversation with search results
+              const searchContext = `## Web Search Results\n\n${followUpSearchResults}`
+              const updatedMessages = [
+                ...messages,
+                {
+                  role: 'assistant' as const,
+                  parts: [{ type: 'text', text }],
+                },
+                {
+                  role: 'user' as const,
+                  parts: [{ type: 'text', text: `Here are the search results:\n\n${searchContext}\n\nPlease provide a comprehensive answer based on these results.` }],
+                },
+              ]
+              
+              const updatedOciMessages = convertToOciMessages(updatedMessages, undefined)
+              const followUpRequest: requests.ChatRequest = {
+                chatDetails: {
+                  compartmentId: COMPARTMENT_ID,
+                  servingMode,
+                  chatRequest: {
+                    messages: updatedOciMessages,
+                    apiFormat: 'GENERIC',
+                    maxTokens: 4000,
+                    temperature: 0.7,
+                    frequencyPenalty: 0,
+                    presencePenalty: 0,
+                    topK: 40,
+                    topP: 0.95,
+                  } as models.GenericChatRequest,
+                },
+                retryConfiguration: NoRetryConfigurationDetails,
+              }
+              
+              const followUpResponse = await client.chat(followUpRequest)
+              if (!followUpResponse || followUpResponse instanceof ReadableStream) {
+                throw new Error('Unexpected OCI response format')
+              }
+              
+              const followUpResult = followUpResponse.chatResult
+              const followUpGenericResponse = followUpResult.chatResponse as models.GenericChatResponse
+              const followUpChoice = followUpGenericResponse?.choices?.[0]
+              const followUpMsg = followUpChoice?.message as { content?: Array<{ type?: string; text?: string }> } | undefined
+              
+              let followUpText = ''
+              if (followUpMsg?.content?.length) {
+                followUpText = followUpMsg.content
+                  .filter((c) => (c.type === 'TEXT' || c.type === 'text') && 'text' in c)
+                  .map((c) => (c.text ?? '').toString())
+                  .join('')
+              }
+              
+              // Write initial response
+              writer.write({ type: 'text-start', id: textId })
+              writer.write({ type: 'text-delta', id: textId, delta: text + '\n\n' })
+              writer.write({ type: 'text-end', id: textId })
+              
+              // Write follow-up response with search results
+              if (followUpText) {
+                const followUpId = generateId()
+                writer.write({ type: 'text-start', id: followUpId })
+                writer.write({ type: 'text-delta', id: followUpId, delta: followUpText })
+                writer.write({ type: 'text-end', id: followUpId })
+              }
+              
+              return
+            }
+          }
         }
 
         if (text) {

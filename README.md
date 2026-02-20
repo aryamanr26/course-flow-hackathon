@@ -10,6 +10,7 @@ AI course scheduling assistant for university students. Chat is powered by **OCI
 
 - WSL with Ubuntu (or similar Linux)
 - OCI account and API key for chat (see [OCI setup](#oci-setup-optional))
+- SerpAPI key for web search (optional, see [SerpAPI setup](#serpapi-setup-optional))
 
 ---
 
@@ -53,6 +54,25 @@ Chat uses **OCI Generative AI**. To enable it:
 3. In `config`, set `key_file` to the **full path** to the `.pem` file (e.g. `/home/you/course-flow-hackathon/.oci/your-key.pem`).
 
 Without OCI config, the chat API will return an error when you send a message.
+
+---
+
+## SerpAPI setup (optional)
+
+Web search functionality uses **SerpAPI** for Google searches. To enable it:
+
+1. Sign up for a free account at [serpapi.com](https://serpapi.com)
+2. Get your API key from the dashboard
+3. Set the environment variable:
+   ```bash
+   export SERPAPI_KEY=your_api_key_here
+   ```
+   Or create a `.env.local` file in the project root:
+   ```
+   SERPAPI_KEY=your_api_key_here
+   ```
+
+Without SerpAPI key, web search will be unavailable but the chat will still work for course-related queries.
 
 ---
 
