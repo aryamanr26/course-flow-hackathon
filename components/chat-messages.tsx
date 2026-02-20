@@ -36,9 +36,11 @@ function formatMarkdown(text: string) {
   const blocks = text.split(/\n\n+/)
 
   return blocks.map((block, blockIdx) => {
-    // Check if it's a list
-    const listItems = block.split('\n').filter(l => l.match(/^[-*]\s/))
-    if (listItems.length > 0 && listItems.length === block.split('\n').filter(Boolean).length) {
+    const lines = block.split('\n').filter(Boolean)
+    
+    // Check if it's a list (all lines are list items)
+    const listItems = lines.filter(l => l.match(/^[-*]\s/))
+    if (listItems.length > 0 && listItems.length === lines.length) {
       return (
         <ul key={blockIdx} className="list-none flex flex-col gap-1.5 my-2">
           {listItems.map((item, i) => (
@@ -51,9 +53,9 @@ function formatMarkdown(text: string) {
       )
     }
 
-    // Check numbered list
-    const numberedItems = block.split('\n').filter(l => l.match(/^\d+\.\s/))
-    if (numberedItems.length > 0 && numberedItems.length === block.split('\n').filter(Boolean).length) {
+    // Check numbered list (all lines are numbered items)
+    const numberedItems = lines.filter(l => l.match(/^\d+\.\s/))
+    if (numberedItems.length > 0 && numberedItems.length === lines.length) {
       return (
         <ol key={blockIdx} className="list-none flex flex-col gap-1.5 my-2">
           {numberedItems.map((item, i) => (
@@ -64,6 +66,47 @@ function formatMarkdown(text: string) {
           ))}
         </ol>
       )
+    }
+
+    // Check if block contains list items mixed with text (e.g., "Header: * item")
+    // Split into parts: text before list, list items, text after list
+    const parts: React.ReactNode[] = []
+    let currentText: string[] = []
+    
+    for (const line of lines) {
+      if (line.match(/^[-*]\s/)) {
+        // Flush accumulated text as paragraph
+        if (currentText.length > 0) {
+          parts.push(
+            <p key={`text-${parts.length}`} className="text-sm leading-relaxed my-1">
+              {formatInlineMarkdown(currentText.join('\n'))}
+            </p>
+          )
+          currentText = []
+        }
+        // Add list item
+        parts.push(
+          <div key={`item-${parts.length}`} className="flex gap-2 text-sm leading-relaxed my-0.5">
+            <span className="text-primary mt-0.5 shrink-0">{'>'}</span>
+            <span>{formatInlineMarkdown(line.replace(/^[-*]\s/, ''))}</span>
+          </div>
+        )
+      } else {
+        currentText.push(line)
+      }
+    }
+    
+    // Flush remaining text
+    if (currentText.length > 0) {
+      parts.push(
+        <p key={`text-${parts.length}`} className="text-sm leading-relaxed my-1">
+          {formatInlineMarkdown(currentText.join('\n'))}
+        </p>
+      )
+    }
+    
+    if (parts.length > 0) {
+      return <div key={blockIdx}>{parts}</div>
     }
 
     // Check if it's a heading (## or ###)
@@ -86,46 +129,139 @@ function formatMarkdown(text: string) {
 }
 
 function formatInlineMarkdown(text: string) {
-  // Handle **bold** and *italic* and `code`
+  // Handle **bold**, *italic*, `code`, and inline bullet points (* item)
+  // Process in order: bullet points first, then bold, then italic, then code
+  let processed = text
   const parts: (string | React.ReactElement)[] = []
-  let remaining = text
   let keyCount = 0
 
-  while (remaining.length > 0) {
-    // Bold
-    const boldMatch = remaining.match(/\*\*(.+?)\*\*/)
-    // Code
-    const codeMatch = remaining.match(/`(.+?)`/)
+  // Pre-pass: convert inline bullet points (* item) to bullet elements
+  // This handles cases like "Header: * item" within a paragraph
+  const bulletRegex = /(\s|^)\*\s+([^\n*]+?)(?=\s*\*|\s*$|$)/g
+  const bulletMatches: Array<{ start: number; end: number; text: string; prefix: string }> = []
+  let match
+  while ((match = bulletRegex.exec(processed)) !== null) {
+    bulletMatches.push({
+      start: match.index,
+      end: match.index + match[0].length,
+      text: match[2],
+      prefix: match[1] || '',
+    })
+  }
 
-    const matches = [
-      boldMatch ? { type: 'bold', index: boldMatch.index!, match: boldMatch } : null,
-      codeMatch ? { type: 'code', index: codeMatch.index!, match: codeMatch } : null,
-    ].filter(Boolean).sort((a, b) => a!.index - b!.index)
+  // If we found bullet points, render them as a list
+  if (bulletMatches.length > 0) {
+    // Split text by bullet points and render accordingly
+    let lastIndex = 0
+    for (const bullet of bulletMatches) {
+      // Add text before bullet
+      if (bullet.start > lastIndex) {
+        const beforeText = processed.substring(lastIndex, bullet.start + bullet.prefix.length)
+        if (beforeText.trim()) {
+          parts.push(beforeText)
+        }
+      }
+      // Add bullet point
+      parts.push(
+        <span key={keyCount++} className="inline-flex items-start gap-1.5 my-0.5">
+          <span className="text-primary mt-0.5 shrink-0">{'>'}</span>
+          <span>{bullet.text.trim()}</span>
+        </span>
+      )
+      lastIndex = bullet.end
+    }
+    // Add remaining text
+    if (lastIndex < processed.length) {
+      parts.push(processed.substring(lastIndex))
+    }
+    // Re-process the parts to handle bold/italic/code within them
+    return parts.map((part, idx) => {
+      if (typeof part === 'string') {
+        return <span key={idx}>{formatInlineMarkdownWithoutBullets(part)}</span>
+      }
+      return part
+    })
+  }
 
-    if (matches.length === 0) {
-      parts.push(remaining)
-      break
+  // No bullet points found, proceed with normal formatting
+  return formatInlineMarkdownWithoutBullets(processed)
+}
+
+function formatInlineMarkdownWithoutBullets(text: string) {
+  const parts: (string | React.ReactElement)[] = []
+  let keyCount = 0
+
+  // First pass: handle bold (**text**)
+  const boldRegex = /\*\*(.+?)\*\*/g
+  const boldMatches: Array<{ start: number; end: number; text: string }> = []
+  let match
+  while ((match = boldRegex.exec(text)) !== null) {
+    boldMatches.push({ start: match.index, end: match.index + match[0].length, text: match[1] })
+  }
+
+  // Second pass: handle italic (*text*) - but skip if it's part of bold or a bullet point
+  // Bullet points are * followed by space, so we exclude those
+  const italicRegex = /\*([^*]+?)\*/g
+  const italicMatches: Array<{ start: number; end: number; text: string }> = []
+  while ((match = italicRegex.exec(text)) !== null) {
+    // Check if this italic match overlaps with any bold match
+    const overlapsBold = boldMatches.some(b => 
+      match!.index >= b.start && match!.index < b.end
+    )
+    // Check if asterisk is immediately followed by space (bullet point marker like "* item")
+    // This means the match content starts with a space
+    const charAfterAsterisk = text[match.index + 1]
+    const isBulletPoint = charAfterAsterisk === ' '
+    
+    if (!overlapsBold && !isBulletPoint) {
+      italicMatches.push({ start: match.index, end: match.index + match[0].length, text: match[1] })
+    }
+  }
+
+  // Third pass: handle code (`text`)
+  const codeRegex = /`(.+?)`/g
+  const codeMatches: Array<{ start: number; end: number; text: string }> = []
+  while ((match = codeRegex.exec(text)) !== null) {
+    codeMatches.push({ start: match.index, end: match.index + match[0].length, text: match[1] })
+  }
+
+  // Combine all matches and sort by position
+  const allMatches = [
+    ...boldMatches.map(m => ({ ...m, type: 'bold' as const })),
+    ...italicMatches.map(m => ({ ...m, type: 'italic' as const })),
+    ...codeMatches.map(m => ({ ...m, type: 'code' as const })),
+  ].sort((a, b) => a.start - b.start)
+
+  // Build the result
+  let lastIndex = 0
+  for (const m of allMatches) {
+    // Add text before this match
+    if (m.start > lastIndex) {
+      parts.push(text.substring(lastIndex, m.start))
     }
 
-    const first = matches[0]!
-    if (first.index > 0) {
-      parts.push(remaining.substring(0, first.index))
-    }
-
-    if (first.type === 'bold') {
-      parts.push(<strong key={keyCount++} className="font-semibold text-foreground">{first.match[1]}</strong>)
-    } else if (first.type === 'code') {
+    // Add the formatted element
+    if (m.type === 'bold') {
+      parts.push(<strong key={keyCount++} className="font-semibold text-foreground">{m.text}</strong>)
+    } else if (m.type === 'italic') {
+      parts.push(<em key={keyCount++} className="italic text-foreground">{m.text}</em>)
+    } else if (m.type === 'code') {
       parts.push(
         <code key={keyCount++} className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono text-primary">
-          {first.match[1]}
+          {m.text}
         </code>
       )
     }
 
-    remaining = remaining.substring(first.index + first.match[0].length)
+    lastIndex = m.end
   }
 
-  return parts
+  // Add remaining text
+  if (lastIndex < text.length) {
+    parts.push(text.substring(lastIndex))
+  }
+
+  return parts.length > 0 ? parts : [text]
 }
 
 export function ChatMessage({ message, isStreaming }: { message: UIMessage; isStreaming: boolean }) {

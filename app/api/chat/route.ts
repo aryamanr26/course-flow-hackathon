@@ -5,7 +5,16 @@ import {
   ConfigFileAuthenticationDetailsProvider,
   NoRetryConfigurationDetails,
 } from 'oci-common'
-import { studentProfile } from '@/lib/data'
+import {
+  studentProfile,
+  availableCourses,
+  meetsPrerequisites,
+  getReviewsForCourse,
+  getAverageRating,
+  getRemainingRequirements,
+  checkScheduleConflict,
+  calendarEvents,
+} from '@/lib/data'
 
 export const maxDuration = 30
 
@@ -37,7 +46,7 @@ ${studentProfile.completedCourses.map(c => `- ${c.code}: ${c.name} (${c.grade})`
 - Give concrete, actionable advice about which courses to take and when.
 - Consider workload balance when suggesting multiple courses together.
 - Keep responses concise but thorough.
-- Note: You do not have access to tools in this mode. Suggest that students explore the course catalog and reviews panels for detailed course information.`
+- When the student asks for a list of all courses or what's available, you will receive the full catalog in the context below—use it to answer. When they ask about a specific course, you will receive prerequisites, ratings, and reviews in the context below.`
 
 // AI SDK useChat sends messages with `parts` (not content)
 type UIMessage = {
@@ -55,16 +64,205 @@ function getMessageText(msg: UIMessage): string {
     .join('\n')
 }
 
-function convertToOciMessages(messages: UIMessage[]): Array<{ role: string; content: Array<{ type: string; text?: string }> }> {
+// Match course codes like "CS 470", "ECE 501", "MATH 301"
+const COURSE_CODE_REGEX = /\b([A-Z]{2,4}\s*\d{3,4})\b/gi
+
+function extractCourseCodes(text: string): string[] {
+  const matches = text.match(COURSE_CODE_REGEX) ?? []
+  const seen = new Set<string>()
+  const codes: string[] = []
+  for (const m of matches) {
+    const normalized = m.replace(/\s+/g, ' ').trim()
+    const withSpace = normalized.includes(' ')
+      ? normalized
+      : normalized.replace(/([A-Z]{2,4})(\d{3,4})/i, '$1 $2')
+    const found = availableCourses.find(
+      (c) => c.code.toUpperCase() === withSpace.toUpperCase()
+    )
+    if (found && !seen.has(found.code)) {
+      seen.add(found.code)
+      codes.push(found.code)
+    }
+  }
+  return codes
+}
+
+function buildCourseContext(courseCode: string): string {
+  const course = availableCourses.find((c) => c.code === courseCode)
+  if (!course) return ''
+
+  const prereq = meetsPrerequisites(courseCode)
+  const reviews = getReviewsForCourse(courseCode)
+  const rating = getAverageRating(courseCode)
+
+  const scheduleInfo = course.schedule && course.schedule.length > 0
+    ? `Schedule:\n${course.schedule.map(s => `- ${s.days.join(', ')}: ${s.startTime}–${s.endTime}`).join('\n')}`
+    : 'Schedule: Not available'
+
+  return `
+Course: ${course.code} - ${course.name}
+${scheduleInfo}
+Prerequisites Met: ${prereq.met}
+Missing Prerequisites: ${prereq.missing.join(', ') || 'None'}
+
+Average Rating: ${rating.toFixed(1)}/5
+Recent Reviews:
+${reviews.slice(0, 3).map((r) => `- ${r.comment}`).join('\n') || '(No reviews yet)'}
+`.trim()
+}
+
+function isAskingForCourseList(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    /\b(all|list|show|give me|what are)\s+(the\s+)?(available\s+)?courses\b/.test(lower) ||
+    /\b(available|offered)\s+courses\b/.test(lower) ||
+    /\bcourse\s+catalog\b/.test(lower) ||
+    /\bwhat\s+courses\s+(are\s+)?(available|offered)?\b/.test(lower)
+  )
+}
+
+function buildFullCatalogContext(): string {
+  return `## Full course catalog\n${availableCourses.map((c) => `- ${c.code}: ${c.name} (${c.credits} cr)`).join('\n')}`
+}
+
+function isAskingForRemainingRequirements(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    /\b(core\s+)?requirements?\s+(do\s+i\s+still\s+need|remaining|left)\b/.test(lower) ||
+    /\bwhat\s+(core\s+)?(requirements?|do\s+i\s+still\s+need)\b/.test(lower) ||
+    /\bremaining\s+(core\s+)?requirements?\b/.test(lower) ||
+    /\bdegree\s+requirements?\s+(remaining|left|still)\b/.test(lower) ||
+    /\bwhat\s+(courses?|credits?)\s+(do\s+i\s+still\s+need|remaining)\b/.test(lower)
+  )
+}
+
+function buildRequirementsContext(): string {
+  const remaining = getRemainingRequirements()
+  return `## Remaining degree requirements
+
+Remaining Core:
+${remaining.remainingCore.map((c) => c.code + ' - ' + c.name).join('\n') || '(None - all core completed)'}
+
+Electives Still Needed: ${remaining.remainingElectivesNeeded}
+
+Elective options still available:
+${remaining.electiveOptions.map((c) => `- ${c.code}: ${c.name}`).join('\n') || '(None)'}`.trim()
+}
+
+function isAskingAboutScheduleConflict(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    /\bconflict(s)?\s+(with\s+)?(my\s+)?schedule\b/.test(lower) ||
+    /\b(does|do)\s+.+\s+conflict\b/.test(lower) ||
+    /\bschedule\s+conflict\b/.test(lower) ||
+    /\bconflict\s+with\s+(my\s+)?(calendar|schedule)\b/.test(lower)
+  )
+}
+
+function buildConflictContext(courseCode: string): string {
+  const course = availableCourses.find((c) => c.code === courseCode)
+  if (!course || !course.schedule?.length) return ''
+
+  const allConflicts: { title: string }[] = []
+  const seen = new Set<string>()
+  for (const slot of course.schedule) {
+    const conflicts = checkScheduleConflict(
+      slot.days,
+      slot.startTime,
+      slot.endTime,
+      calendarEvents
+    )
+    for (const e of conflicts) {
+      if (!seen.has(e.id)) {
+        seen.add(e.id)
+        allConflicts.push({ title: e.title })
+      }
+    }
+  }
+
+  const conflictList =
+    allConflicts.length === 0
+      ? 'None'
+      : allConflicts.map((e) => e.title).join(', ')
+  return `## Schedule conflict check: ${course.code} - ${course.name}\n\nConflicts: ${conflictList}`
+}
+
+function isAskingAboutCalendar(text: string): boolean {
+  const lower = text.toLowerCase()
+
+  return (
+    /\bcalendar\b/.test(lower) ||
+    /\bcalender\b/.test(lower) || // common misspelling
+    /\bmy\s+schedule\b/.test(lower) ||
+    /\bwhat\s+does\s+my\s+week\b/.test(lower) ||
+    /\bhow\s+busy\b/.test(lower)
+  )
+}
+
+function buildCalendarContext(): string {
+  // Group personal events by day
+  const byDay: Record<string, Array<{ title: string; startTime: string; endTime: string; type: string }>> = {}
+  for (const e of calendarEvents) {
+    if (!byDay[e.day]) byDay[e.day] = []
+    byDay[e.day].push({ title: e.title, startTime: e.startTime, endTime: e.endTime, type: e.type })
+  }
+  
+  // Add current courses to the calendar
+  for (const currentCourse of studentProfile.currentCourses) {
+    const course = availableCourses.find((c) => c.code === currentCourse.code)
+    if (course && course.schedule) {
+      for (const slot of course.schedule) {
+        for (const day of slot.days) {
+          if (!byDay[day]) byDay[day] = []
+          byDay[day].push({
+            title: `${course.code} - ${course.name}`,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            type: 'course',
+          })
+        }
+      }
+    }
+  }
+  
+  // Sort events within each day by start time
+  const timeToMinutes = (time: string) => {
+    const [h, m] = time.split(':').map(Number)
+    return h * 60 + m
+  }
+  for (const day in byDay) {
+    byDay[day].sort((a, b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime))
+  }
+  
+  const daysOrder = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+  const lines: string[] = ['## Student calendar (current courses + weekly recurring events)']
+  for (const day of daysOrder) {
+    const events = byDay[day]
+    if (!events?.length) continue
+    lines.push(`\n### ${day}`)
+    for (const e of events) {
+      lines.push(`- ${e.title}: ${e.startTime}–${e.endTime} (${e.type})`)
+    }
+  }
+  return lines.join('\n').trim()
+}
+
+function convertToOciMessages(
+  messages: UIMessage[],
+  courseContext?: string
+): Array<{ role: string; content: Array<{ type: string; text?: string }> }> {
   const ociMessages: Array<{
     role: string
     content: Array<{ type: string; text?: string }>
   }> = []
 
-  // Always include system prompt at the top (student profile + guidelines)
+  const systemText = courseContext
+    ? `${systemPrompt}\n\n## Context for mentioned course(s)\n${courseContext}`
+    : systemPrompt
+
   ociMessages.push({
     role: 'SYSTEM',
-    content: [{ type: 'TEXT', text: systemPrompt }],
+    content: [{ type: 'TEXT', text: systemText }],
   })
 
   for (const msg of messages) {
@@ -102,7 +300,33 @@ export async function POST(req: Request) {
           servingType: 'ON_DEMAND',
         }
 
-        const ociMessages = convertToOciMessages(messages)
+        const lastUserText = getMessageText(
+          messages.filter((m: UIMessage) => m.role === 'user').slice(-1)[0]
+        ) || ''
+        const courseCodes = extractCourseCodes(lastUserText)
+        const contextParts: string[] = []
+        if (courseCodes.length > 0) {
+          contextParts.push(courseCodes.map(buildCourseContext).join('\n\n---\n\n'))
+        }
+        if (isAskingForCourseList(lastUserText)) {
+          contextParts.push(buildFullCatalogContext())
+        }
+        if (isAskingForRemainingRequirements(lastUserText)) {
+          contextParts.push(buildRequirementsContext())
+        }
+        if (isAskingAboutScheduleConflict(lastUserText) && courseCodes.length > 0) {
+          contextParts.push(
+            courseCodes.map(buildConflictContext).filter(Boolean).join('\n\n---\n\n')
+          )
+        }
+        if (isAskingAboutCalendar(lastUserText)) {
+          contextParts.push(buildCalendarContext())
+        }
+        const courseContext = contextParts.length > 0 ? contextParts.join('\n\n---\n\n') : undefined
+
+        console.log("Context injected:\n", courseContext || '(none)')
+
+        const ociMessages = convertToOciMessages(messages, courseContext)
 
         if (ociMessages.length === 0) {
           throw new Error(
