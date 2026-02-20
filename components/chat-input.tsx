@@ -10,8 +10,22 @@ interface ChatInputProps {
   status: string
 }
 
+function needsWebSearchUI(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    /\b(search|google|look up|find information about)\b/.test(lower) ||
+    /\bneed (more )?information (on|about|regarding)\b/.test(lower) ||
+    /\bwhat is\b.*\b(current|recent|latest|news|today)\b/.test(lower) ||
+    /\bwhat are\b.*\b(current|recent|latest|news|today)\b/.test(lower) ||
+    /\bai news\b/.test(lower) ||
+    /\btech news\b/.test(lower) ||
+    /\b(latest|recent|current)\b.*\b(courses|classes|programs)\b/.test(lower)
+  )
+}
+
 export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
   const [input, setInput] = useState('')
+  const [isSearching, setIsSearching] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
@@ -23,8 +37,12 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
-    if (!input.trim() || disabled) return
-    onSend(input.trim())
+    const trimmed = input.trim()
+    if (!trimmed || disabled) return
+
+    // Detect if this question will trigger a web search
+    setIsSearching(needsWebSearchUI(trimmed))
+    onSend(trimmed)
     setInput('')
   }
 
@@ -36,6 +54,14 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
   }
 
   const isLoading = status === 'streaming' || status === 'submitted'
+  const loadingLabel = isSearching ? 'Browsing...' : 'Thinking...'
+
+  // Reset searching state when request finishes
+  useEffect(() => {
+    if (!isLoading) {
+      setIsSearching(false)
+    }
+  }, [isLoading])
 
   return (
     <div className="border-t border-border/50 bg-background/80 backdrop-blur-lg px-4 py-3">
@@ -47,7 +73,7 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isLoading ? 'Thinking...' : 'Ask about courses, schedules, or reviews...'}
+            placeholder={isLoading ? loadingLabel : 'Ask about courses, schedules, or reviews...'}
             disabled={disabled}
             rows={1}
             className="flex-1 resize-none bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none disabled:opacity-50"

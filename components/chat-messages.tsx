@@ -74,7 +74,29 @@ function formatMarkdown(text: string) {
     let currentText: string[] = []
     
     for (const line of lines) {
-      if (line.match(/^[-*]\s/)) {
+      // Check for headings first
+      const headingMatch = line.match(/^(#{1,3})\s(.+)/)
+      if (headingMatch) {
+        // Flush accumulated text as paragraph
+        if (currentText.length > 0) {
+          parts.push(
+            <p key={`text-${parts.length}`} className="text-sm leading-relaxed my-1">
+              {formatInlineMarkdown(currentText.join('\n'))}
+            </p>
+          )
+          currentText = []
+        }
+        // Add heading
+        const level = headingMatch[1].length
+        const headingText = headingMatch[2]
+        if (level === 1) {
+          parts.push(<h3 key={`heading-${parts.length}`} className="text-base font-bold mt-3 mb-1 text-foreground">{headingText}</h3>)
+        } else if (level === 2) {
+          parts.push(<h4 key={`heading-${parts.length}`} className="text-sm font-bold mt-3 mb-1 text-foreground">{headingText}</h4>)
+        } else {
+          parts.push(<h5 key={`heading-${parts.length}`} className="text-sm font-semibold mt-2 mb-1 text-foreground">{headingText}</h5>)
+        }
+      } else if (line.match(/^[-*]\s/)) {
         // Flush accumulated text as paragraph
         if (currentText.length > 0) {
           parts.push(
@@ -133,7 +155,6 @@ function formatInlineMarkdown(text: string) {
   // Process in order: bullet points first, then bold, then italic, then code
   let processed = text
   const parts: (string | React.ReactElement)[] = []
-  let keyCount = 0
 
   // Pre-pass: convert inline bullet points (* item) to bullet elements
   // This handles cases like "Header: * item" within a paragraph
@@ -163,7 +184,7 @@ function formatInlineMarkdown(text: string) {
       }
       // Add bullet point
       parts.push(
-        <span key={keyCount++} className="inline-flex items-start gap-1.5 my-0.5">
+        <span className="inline-flex items-start gap-1.5 my-0.5">
           <span className="text-primary mt-0.5 shrink-0">{'>'}</span>
           <span>{bullet.text.trim()}</span>
         </span>
@@ -179,7 +200,8 @@ function formatInlineMarkdown(text: string) {
       if (typeof part === 'string') {
         return <span key={idx}>{formatInlineMarkdownWithoutBullets(part)}</span>
       }
-      return part
+      // Wrap non-string parts with a unique key as well
+      return <span key={idx}>{part}</span>
     })
   }
 

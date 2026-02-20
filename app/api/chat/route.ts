@@ -48,7 +48,8 @@ ${studentProfile.completedCourses.map(c => `- ${c.code}: ${c.name} (${c.grade})`
 - Consider workload balance when suggesting multiple courses together.
 - Keep responses concise but thorough.
 - When the student asks for a list of all courses or what's available, you will receive the full catalog in the context below—use it to answer. When they ask about a specific course, you will receive prerequisites, ratings, and reviews in the context below.
-- If you don't have information about something outside the course catalog (like current events, recent news, or external information), you can request a web search by saying "I need to search for more information about [topic]". The system will perform a Google search and provide you with the results.`
+- You may sometimes receive web search results in your context. When you do, silently incorporate them into your answer. Do not mention that you searched, do not thank the user for results, and do not describe the search process—just answer the question directly.
+- IMPORTANT: All web searches are automatically focused on University of Michigan (U-M) context. Search results will prioritize information relevant to U-M students, courses, programs, and campus resources.`
 
 // AI SDK useChat sends messages with `parts` (not content)
 type UIMessage = {
@@ -201,7 +202,15 @@ function isAskingAboutCalendar(text: string): boolean {
   )
 }
 
-async function performGoogleSearch(query: string): Promise<string> {
+function wantsMoreResults(text: string): boolean {
+  const lower = text.toLowerCase()
+  return (
+    /\b(more|additional|extra|all|show (me )?more|give me more|show all|all results)\b/.test(lower) ||
+    /\b(5|6|7|8|9|10|\d+)\s+(results?|links?|sources?)\b/.test(lower)
+  )
+}
+
+async function performGoogleSearch(query: string, numResults: number = 3): Promise<string> {
   // Next.js reads from .env.local or environment variables
   const serpApiKey = process.env.SERPAPI_KEY || process.env.NEXT_PUBLIC_SERPAPI_KEY
   if (!serpApiKey) {
@@ -210,11 +219,30 @@ async function performGoogleSearch(query: string): Promise<string> {
   }
 
   try {
+    // Focus search on University of Michigan - add U-M context to query
+    // Check if query already mentions U-M or University of Michigan
+    const lowerQuery = query.toLowerCase()
+    const hasUMichContext = 
+      lowerQuery.includes('university of michigan') ||
+      lowerQuery.includes('umich') ||
+      lowerQuery.includes('u-m') ||
+      lowerQuery.includes('u of m')
+    
+    // Enhance query with University of Michigan context if not already present
+    const enhancedQuery = hasUMichContext 
+      ? query 
+      : `${query} University of Michigan`
+    
+    console.log(`Searching with U-M focused query: "${enhancedQuery}" (showing ${numResults} results)`)
+    
     const results = await serpapi.getJson({
       engine: 'google',
-      q: query,
+      q: enhancedQuery,
       api_key: serpApiKey,
-      num: 5, // Get top 5 results
+      num: numResults, // Default to 3, can be increased if user asks for more
+      location: 'Ann Arbor, Michigan, United States', // Focus on Ann Arbor location
+      gl: 'us', // Country code
+      hl: 'en', // Language
     })
 
     const organicResults = results.organic_results || []
@@ -442,8 +470,10 @@ export async function POST(req: Request) {
           const searchQuery = extractSearchQuery(lastUserText)
           console.log(`needsWebSearch=true, extracted query: ${searchQuery}`)
           if (searchQuery) {
-            console.log(`Performing proactive search for: ${searchQuery}`)
-            searchResults = await performGoogleSearch(searchQuery)
+            // Check if user wants more results
+            const numResults = wantsMoreResults(lastUserText) ? 10 : 3
+            console.log(`Performing proactive search for: ${searchQuery} (${numResults} results)`)
+            searchResults = await performGoogleSearch(searchQuery, numResults)
             contextParts.push(searchResults)
           } else {
             console.log(`needsWebSearch=true but extractSearchQuery returned null`)
@@ -501,93 +531,6 @@ export async function POST(req: Request) {
             .filter((c) => (c.type === 'TEXT' || c.type === 'text') && 'text' in c)
             .map((c) => (c.text ?? '').toString())
             .join('')
-        }
-
-        // Check if assistant is requesting a search (if we didn't already search)
-        if (text && !searchResults) {
-          // Check if assistant is asking to search
-          const isRequestingSearch = /I need to search/i.test(text) || /search for/i.test(text)
-          if (isRequestingSearch) {
-            // Use the original user question as the search query
-            let searchQuery = extractSearchQuery(lastUserText) || lastUserText.replace(/\?$/, '').trim()
-            // Clean up the query
-            searchQuery = searchQuery.replace(/^(i need (more )?information (on|about|regarding)|tell me about|what is|what are|what's)\s+/i, '')
-            searchQuery = searchQuery.replace(/^(the|a|an)\s+/i, '')
-            searchQuery = searchQuery.trim()
-            
-            if (searchQuery && searchQuery.length > 2) {
-              console.log(`Assistant requested search, using query: ${searchQuery}`)
-              
-              // Perform search
-              const followUpSearchResults = await performGoogleSearch(searchQuery)
-              
-              // Continue conversation with search results
-              const searchContext = `## Web Search Results\n\n${followUpSearchResults}`
-              const updatedMessages = [
-                ...messages,
-                {
-                  role: 'assistant' as const,
-                  parts: [{ type: 'text', text }],
-                },
-                {
-                  role: 'user' as const,
-                  parts: [{ type: 'text', text: `Here are the search results:\n\n${searchContext}\n\nPlease provide a comprehensive answer based on these results.` }],
-                },
-              ]
-              
-              const updatedOciMessages = convertToOciMessages(updatedMessages, undefined)
-              const followUpRequest: requests.ChatRequest = {
-                chatDetails: {
-                  compartmentId: COMPARTMENT_ID,
-                  servingMode,
-                  chatRequest: {
-                    messages: updatedOciMessages,
-                    apiFormat: 'GENERIC',
-                    maxTokens: 4000,
-                    temperature: 0.7,
-                    frequencyPenalty: 0,
-                    presencePenalty: 0,
-                    topK: 40,
-                    topP: 0.95,
-                  } as models.GenericChatRequest,
-                },
-                retryConfiguration: NoRetryConfigurationDetails,
-              }
-              
-              const followUpResponse = await client.chat(followUpRequest)
-              if (!followUpResponse || followUpResponse instanceof ReadableStream) {
-                throw new Error('Unexpected OCI response format')
-              }
-              
-              const followUpResult = followUpResponse.chatResult
-              const followUpGenericResponse = followUpResult.chatResponse as models.GenericChatResponse
-              const followUpChoice = followUpGenericResponse?.choices?.[0]
-              const followUpMsg = followUpChoice?.message as { content?: Array<{ type?: string; text?: string }> } | undefined
-              
-              let followUpText = ''
-              if (followUpMsg?.content?.length) {
-                followUpText = followUpMsg.content
-                  .filter((c) => (c.type === 'TEXT' || c.type === 'text') && 'text' in c)
-                  .map((c) => (c.text ?? '').toString())
-                  .join('')
-              }
-              
-              // Write initial response
-              writer.write({ type: 'text-start', id: textId })
-              writer.write({ type: 'text-delta', id: textId, delta: text + '\n\n' })
-              writer.write({ type: 'text-end', id: textId })
-              
-              // Write follow-up response with search results
-              if (followUpText) {
-                const followUpId = generateId()
-                writer.write({ type: 'text-start', id: followUpId })
-                writer.write({ type: 'text-delta', id: followUpId, delta: followUpText })
-                writer.write({ type: 'text-end', id: followUpId })
-              }
-              
-              return
-            }
-          }
         }
 
         if (text) {
