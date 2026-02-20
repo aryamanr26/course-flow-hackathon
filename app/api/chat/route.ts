@@ -1,22 +1,22 @@
+import { createUIMessageStream, createUIMessageStreamResponse, generateId } from 'ai'
+import { join } from 'node:path'
+import { GenerativeAiInferenceClient, models, requests } from 'oci-generativeaiinference'
 import {
-  convertToModelMessages,
-  streamText,
-  tool,
-  stepCountIs,
-} from 'ai'
-import { z } from 'zod'
-import {
-  availableCourses,
-  studentProfile,
-  calendarEvents,
-  courseReviews,
-  getRemainingRequirements,
-  checkScheduleConflict,
-  meetsPrerequisites,
-  getAverageRating,
-} from '@/lib/data'
+  ConfigFileAuthenticationDetailsProvider,
+  NoRetryConfigurationDetails,
+} from 'oci-common'
+import { studentProfile } from '@/lib/data'
 
 export const maxDuration = 30
+
+// OCI config: use project .oci/config if present, else ~/.oci/config
+const CONFIG_LOCATION =
+  process.env.OCI_CONFIG_LOCATION ??
+  join(process.cwd(), '.oci', 'config')
+const CONFIG_PROFILE = process.env.OCI_CONFIG_PROFILE ?? 'DEFAULT'
+const COMPARTMENT_ID = "ocid1.tenancy.oc1..aaaaaaaaloqxfso4y4fro7q7f3dtsx3s2a4qupoqaieqvl4t536hstvvflxa";
+const ENDPOINT = "https://inference.generativeai.us-chicago-1.oci.oraclecloud.com";
+const MODEL_ID = "ocid1.generativeaimodel.oc1.us-chicago-1.amaaaaaask7dceyavwtf4vi3u7mpzniugmfbinljhtnktexnmnikwolykzma";
 
 const systemPrompt = `You are CourseFlow, an AI course scheduling assistant for university students. You help students plan their course schedules by understanding their degree requirements, checking for conflicts, and providing insights from course reviews.
 
@@ -33,276 +33,138 @@ const systemPrompt = `You are CourseFlow, an AI course scheduling assistant for 
 ${studentProfile.completedCourses.map(c => `- ${c.code}: ${c.name} (${c.grade})`).join('\n')}
 
 ## Guidelines
-- Always check prerequisites before recommending a course.
-- When suggesting courses, proactively check for calendar conflicts with their existing commitments.
-- When the student asks about a course, proactively look up reviews so they have peer feedback.
 - Be conversational and friendly - you're talking to college students.
 - Give concrete, actionable advice about which courses to take and when.
 - Consider workload balance when suggesting multiple courses together.
-- If a course is nearly full, mention that urgency.
-- Use the tools available to you to look up specific information rather than guessing.
-- When presenting course info, format it nicely with the key details.
-- Keep responses concise but thorough.`
+- Keep responses concise but thorough.
+- Note: You do not have access to tools in this mode. Suggest that students explore the course catalog and reviews panels for detailed course information.`
+
+// AI SDK useChat sends messages with `parts` (not content)
+type UIMessage = {
+  id?: string
+  role: 'user' | 'assistant' | 'system'
+  parts?: Array<{ type: string; text?: string }>
+  content?: Array<{ type: string; text?: string }> // fallback for older shape
+}
+
+function getMessageText(msg: UIMessage): string {
+  const parts = msg.parts ?? msg.content ?? []
+  return parts
+    .filter((p): p is { type: string; text: string } => p.type === 'text' && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join('\n')
+}
+
+function convertToOciMessages(messages: UIMessage[]): Array<{ role: string; content: Array<{ type: string; text?: string }> }> {
+  // Match working script (oci-chat-test.ts): single USER message, uppercase role.
+  // Send only the latest user message with system prompt so we avoid "Model input cannot be empty".
+  const userMessages = messages.filter((m) => m.role === 'user')
+  const lastUser = userMessages[userMessages.length - 1]
+  if (!lastUser) return []
+
+  const text = getMessageText(lastUser)?.trim() ?? ''
+  if (!text) return []
+
+  const contentText =
+    userMessages.length === 1
+      ? `${systemPrompt}\n\n---\n\n${text}`
+      : text
+
+  return [
+    {
+      role: 'USER',
+      content: [{ type: 'TEXT', text: contentText }],
+    },
+  ]
+}
 
 export async function POST(req: Request) {
   const { messages } = await req.json()
 
-  const result = streamText({
-    model: 'openai/gpt-4o-mini',
-    system: systemPrompt,
-    messages: await convertToModelMessages(messages),
-    stopWhen: stepCountIs(8),
-    tools: {
-      searchCourses: tool({
-        description: 'Search for available courses by department, name, code, or tag. Use this to find courses the student might be interested in.',
-        inputSchema: z.object({
-          query: z.string().describe('Search query - can be course code, name, department, or tag like "elective", "project-heavy", etc.'),
-        }),
-        execute: async ({ query }) => {
-          const q = query.toLowerCase()
-          const results = availableCourses.filter(c =>
-            c.code.toLowerCase().includes(q) ||
-            c.name.toLowerCase().includes(q) ||
-            c.department.toLowerCase().includes(q) ||
-            c.tags.some(t => t.toLowerCase().includes(q)) ||
-            c.instructor.toLowerCase().includes(q) ||
-            c.description.toLowerCase().includes(q)
+  const stream = createUIMessageStream({
+    originalMessages: messages,
+    async execute({ writer }) {
+      try {
+        const provider = new ConfigFileAuthenticationDetailsProvider(
+          CONFIG_LOCATION,
+          CONFIG_PROFILE
+        )
+        const client = new GenerativeAiInferenceClient({
+          authenticationDetailsProvider: provider,
+        })
+        client.endpoint = ENDPOINT
+
+        const servingMode: models.OnDemandServingMode = {
+          modelId: MODEL_ID,
+          servingType: 'ON_DEMAND',
+        }
+
+        const ociMessages = convertToOciMessages(messages)
+
+        if (ociMessages.length === 0) {
+          throw new Error(
+            'No messages to send. Expected at least one user message. (Check that the request sends messages with parts[].type === "text".)'
           )
-          return results.map(c => ({
-            code: c.code,
-            name: c.name,
-            credits: c.credits,
-            instructor: c.instructor,
-            schedule: c.schedule.map(s => `${s.days.join('/')} ${s.startTime}-${s.endTime}`).join(', '),
-            enrolled: `${c.enrolled}/${c.capacity}`,
-            prerequisites: c.prerequisites.length > 0 ? c.prerequisites.join(', ') : 'None',
-            tags: c.tags,
-            description: c.description,
-          }))
-        },
-      }),
+        }
 
-      getRequirements: tool({
-        description: 'Get the remaining degree requirements for the student. Shows what core courses and electives they still need.',
-        inputSchema: z.object({}),
-        execute: async () => {
-          const reqs = getRemainingRequirements()
-          return {
-            remainingCoreCourses: reqs.remainingCore.map(c => `${c.code}: ${c.name} (${c.credits} cr)`),
-            electivesNeeded: reqs.remainingElectivesNeeded,
-            electiveOptions: reqs.electiveOptions.map(c => `${c.code}: ${c.name} (${c.credits} cr)`),
-            completedCoreCount: reqs.completedCore.length,
-            totalCoreRequired: reqs.completedCore.length + reqs.remainingCore.length,
-          }
-        },
-      }),
+        const chatRequest: requests.ChatRequest = {
+          chatDetails: {
+            compartmentId: COMPARTMENT_ID,
+            servingMode,
+            chatRequest: {
+              messages: ociMessages,
+              apiFormat: 'GENERIC',
+              maxTokens: 4000,
+              temperature: 0.7,
+              frequencyPenalty: 0,
+              presencePenalty: 0,
+              topK: 40,
+              topP: 0.95,
+            } as models.GenericChatRequest,
+          },
+          retryConfiguration: NoRetryConfigurationDetails,
+        }
 
-      checkConflicts: tool({
-        description: 'Check if a course schedule conflicts with the student\'s existing calendar (work, clubs, gym, etc). Always use this before recommending a specific course.',
-        inputSchema: z.object({
-          courseCode: z.string().describe('The course code to check, e.g. "CS 370"'),
-        }),
-        execute: async ({ courseCode }) => {
-          const course = availableCourses.find(c => c.code === courseCode)
-          if (!course) return { error: `Course ${courseCode} not found.` }
+        const chatResponse = await client.chat(chatRequest)
 
-          const allConflicts = course.schedule.flatMap(sched =>
-            checkScheduleConflict(sched.days, sched.startTime, sched.endTime, calendarEvents)
-          )
+        if (!chatResponse || chatResponse instanceof ReadableStream) {
+          throw new Error('Unexpected OCI response format')
+        }
 
-          return {
-            courseCode: course.code,
-            courseName: course.name,
-            courseSchedule: course.schedule.map(s => `${s.days.join('/')} ${s.startTime}-${s.endTime}`),
-            hasConflicts: allConflicts.length > 0,
-            conflicts: allConflicts.map(e => ({
-              event: e.title,
-              day: e.day,
-              time: `${e.startTime}-${e.endTime}`,
-              type: e.type,
-            })),
-            calendarNote: allConflicts.length > 0
-              ? `This course conflicts with ${allConflicts.length} event(s) on the student's calendar.`
-              : 'No conflicts found with existing calendar events.',
-          }
-        },
-      }),
+        const chatResult = chatResponse.chatResult
+        const genericResponse = chatResult.chatResponse as models.GenericChatResponse
+        const textId = generateId()
 
-      checkPrerequisites: tool({
-        description: 'Check if the student meets the prerequisites for a specific course.',
-        inputSchema: z.object({
-          courseCode: z.string().describe('The course code to check prerequisites for'),
-        }),
-        execute: async ({ courseCode }) => {
-          const result = meetsPrerequisites(courseCode)
-          const course = availableCourses.find(c => c.code === courseCode)
-          return {
-            courseCode,
-            courseName: course?.name || 'Unknown',
-            prerequisitesMet: result.met,
-            missingPrerequisites: result.missing,
-            allPrerequisites: course?.prerequisites || [],
-            note: result.met
-              ? 'The student meets all prerequisites for this course.'
-              : `The student is missing: ${result.missing.join(', ')}. They cannot enroll until these are completed.`,
-          }
-        },
-      }),
+        // Extract text from response (match structure from working oci-chat-test.ts)
+        let text = ''
+        const choice = genericResponse?.choices?.[0]
+        const msg = choice?.message as { content?: Array<{ type?: string; text?: string }> } | undefined
+        if (msg?.content?.length) {
+          text = msg.content
+            .filter((c) => (c.type === 'TEXT' || c.type === 'text') && 'text' in c)
+            .map((c) => (c.text ?? '').toString())
+            .join('')
+        }
 
-      getCourseReviews: tool({
-        description: 'Get student reviews and feedback for a specific course. Use this when the student asks about a course, wants to know about teaching style, difficulty, or what other students thought.',
-        inputSchema: z.object({
-          courseCode: z.string().describe('The course code to get reviews for, e.g. "CS 410"'),
-        }),
-        execute: async ({ courseCode }) => {
-          const reviews = courseReviews.filter(r => r.courseCode === courseCode)
-          const avgRating = getAverageRating(courseCode)
-          const course = availableCourses.find(c => c.code === courseCode)
-
-          if (reviews.length === 0) {
-            return { courseCode, message: 'No reviews found for this course.' }
-          }
-
-          return {
-            courseCode,
-            courseName: course?.name || 'Unknown',
-            averageRating: avgRating.toFixed(1),
-            totalReviews: reviews.length,
-            reviews: reviews.map(r => ({
-              rating: `${r.rating}/5`,
-              difficulty: `${r.difficulty}/5`,
-              workload: r.workload,
-              teachingStyle: r.teachingStyle,
-              comment: r.comment,
-              grade: r.grade,
-              semester: r.semester,
-              upvotes: r.upvotes,
-            })),
-          }
-        },
-      }),
-
-      getCalendar: tool({
-        description: 'Get the student\'s current calendar with all their recurring commitments (work, clubs, gym, study groups, etc).',
-        inputSchema: z.object({}),
-        execute: async () => {
-          const byDay: Record<string, typeof calendarEvents> = {}
-          for (const event of calendarEvents) {
-            if (!byDay[event.day]) byDay[event.day] = []
-            byDay[event.day].push(event)
-          }
-
-          return {
-            events: Object.entries(byDay).map(([day, events]) => ({
-              day,
-              events: events.map(e => ({
-                title: e.title,
-                time: `${e.startTime}-${e.endTime}`,
-                type: e.type,
-              })),
-            })),
-            note: 'These are recurring weekly commitments from the student\'s Google Calendar.',
-          }
-        },
-      }),
-
-      buildSchedule: tool({
-        description: 'Generate a visual weekly schedule with selected courses and existing calendar events to show the student their potential week. Use this when the student wants to see what their schedule would look like with certain courses.',
-        inputSchema: z.object({
-          courseCodes: z.array(z.string()).describe('Array of course codes to include in the schedule'),
-        }),
-        execute: async ({ courseCodes }) => {
-          const courses = courseCodes
-            .map(code => availableCourses.find(c => c.code === code))
-            .filter(Boolean)
-
-          const schedule: Record<string, Array<{ title: string; start: string; end: string; type: string }>> = {
-            Monday: [], Tuesday: [], Wednesday: [], Thursday: [], Friday: [], Saturday: [],
-          }
-
-          // Add calendar events
-          for (const event of calendarEvents) {
-            if (schedule[event.day]) {
-              schedule[event.day].push({
-                title: event.title,
-                start: event.startTime,
-                end: event.endTime,
-                type: event.type,
-              })
-            }
-          }
-
-          // Add courses
-          for (const course of courses) {
-            if (!course) continue
-            for (const sched of course.schedule) {
-              for (const day of sched.days) {
-                if (schedule[day]) {
-                  schedule[day].push({
-                    title: `${course.code}: ${course.name}`,
-                    start: sched.startTime,
-                    end: sched.endTime,
-                    type: 'course',
-                  })
-                }
-              }
-            }
-          }
-
-          // Sort each day by start time
-          for (const day of Object.keys(schedule)) {
-            schedule[day].sort((a, b) => a.start.localeCompare(b.start))
-          }
-
-          // Check for any conflicts
-          const conflicts: string[] = []
-          for (const course of courses) {
-            if (!course) continue
-            for (const sched of course.schedule) {
-              const courseConflicts = checkScheduleConflict(sched.days, sched.startTime, sched.endTime, calendarEvents)
-              if (courseConflicts.length > 0) {
-                conflicts.push(`${course.code} conflicts with ${courseConflicts.map(c => c.title).join(', ')}`)
-              }
-            }
-          }
-
-          // Check course-to-course conflicts
-          for (let i = 0; i < courses.length; i++) {
-            for (let j = i + 1; j < courses.length; j++) {
-              const c1 = courses[i]
-              const c2 = courses[j]
-              if (!c1 || !c2) continue
-              for (const s1 of c1.schedule) {
-                for (const s2 of c2.schedule) {
-                  const dayOverlap = s1.days.some(d => s2.days.includes(d))
-                  if (dayOverlap) {
-                    const s1Start = parseInt(s1.startTime.replace(':', ''))
-                    const s1End = parseInt(s1.endTime.replace(':', ''))
-                    const s2Start = parseInt(s2.startTime.replace(':', ''))
-                    const s2End = parseInt(s2.endTime.replace(':', ''))
-                    if (s1Start < s2End && s1End > s2Start) {
-                      conflicts.push(`${c1.code} and ${c2.code} have overlapping times`)
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          const totalCredits = courses.reduce((sum, c) => sum + (c?.credits || 0), 0)
-            + studentProfile.currentCourses.reduce((sum, c) => sum + c.credits, 0)
-
-          return {
-            schedule,
-            selectedCourses: courses.map(c => c ? `${c.code}: ${c.name} (${c.credits} cr)` : ''),
-            totalCreditsThisSemester: totalCredits,
-            conflicts: conflicts.length > 0 ? conflicts : ['No conflicts detected!'],
-            note: `This schedule includes ${courses.length} new course(s) plus existing calendar commitments.`,
-          }
-        },
-      }),
+        if (text) {
+          writer.write({ type: 'text-start', id: textId })
+          writer.write({ type: 'text-delta', id: textId, delta: text })
+          writer.write({ type: 'text-end', id: textId })
+        } else {
+          writer.write({ type: 'text-start', id: textId })
+          writer.write({
+            type: 'text-delta',
+            id: textId,
+            delta: 'I apologize, but I was unable to generate a response. Please try again.',
+          })
+          writer.write({ type: 'text-end', id: textId })
+        }
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'An unexpected error occurred'
+        writer.write({ type: 'error', errorText: errorMessage })
+      }
     },
   })
 
-  return result.toUIMessageStreamResponse()
+  return createUIMessageStreamResponse({ stream })
 }
