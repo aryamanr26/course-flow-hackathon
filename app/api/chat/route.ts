@@ -162,7 +162,7 @@ function isAskingAboutScheduleConflict(text: string): boolean {
   )
 }
 
-function buildConflictContext(courseCode: string): string {
+function buildConflictContext(courseCode: string, events: typeof calendarEvents): string {
   const course = availableCourses.find((c) => c.code === courseCode)
   if (!course || !course.schedule?.length) return ''
 
@@ -173,7 +173,7 @@ function buildConflictContext(courseCode: string): string {
       slot.days,
       slot.startTime,
       slot.endTime,
-      calendarEvents
+      events
     )
     for (const e of conflicts) {
       if (!seen.has(e.id)) {
@@ -198,7 +198,16 @@ function isAskingAboutCalendar(text: string): boolean {
     /\bcalender\b/.test(lower) || // common misspelling
     /\bmy\s+schedule\b/.test(lower) ||
     /\bwhat\s+does\s+my\s+week\b/.test(lower) ||
-    /\bhow\s+busy\b/.test(lower)
+    /\bhow\s+busy\b/.test(lower) ||
+    /\b(am i|are you).*doing\b/.test(lower) ||
+    /\bwhat.*doing\b/.test(lower) ||
+    /\bwhat.*(am|pm|time)\b/.test(lower) ||
+    /\bwhen.*(am|pm|time)\b/.test(lower) ||
+    /\bwhat.*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(lower) ||
+    /\bwhat.*(mon|tue|wed|thu|fri|sat|sun)\b/.test(lower) ||
+    /\bdoing.*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/.test(lower) ||
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun).*(am|pm|\d+:\d+|\d+\s*(am|pm))\b/.test(lower) ||
+    /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)'?s?\s+\d+\s*(am|pm)\b/.test(lower)
   )
 }
 
@@ -340,10 +349,10 @@ function extractSearchQuery(text: string, assistantResponse?: string): string | 
   return null
 }
 
-function buildCalendarContext(): string {
+function buildCalendarContext(events: typeof calendarEvents): string {
   // Group personal events by day
   const byDay: Record<string, Array<{ title: string; startTime: string; endTime: string; type: string }>> = {}
-  for (const e of calendarEvents) {
+  for (const e of events) {
     if (!byDay[e.day]) byDay[e.day] = []
     byDay[e.day].push({ title: e.title, startTime: e.startTime, endTime: e.endTime, type: e.type })
   }
@@ -421,7 +430,15 @@ function convertToOciMessages(
 }
 
 export async function POST(req: Request) {
-  const { messages } = await req.json()
+  const body = await req.json()
+  const { messages, calendarEvents: userCalendarEvents } = body
+  
+  // Use imported calendar events if provided, otherwise fall back to static mock data
+  const activeCalendarEvents = (userCalendarEvents && Array.isArray(userCalendarEvents) && userCalendarEvents.length > 0)
+    ? userCalendarEvents
+    : calendarEvents
+  
+  console.log(`Calendar events received: ${userCalendarEvents?.length || 0} imported, ${activeCalendarEvents.length} total active`)
 
   const stream = createUIMessageStream({
     originalMessages: messages,
@@ -457,11 +474,18 @@ export async function POST(req: Request) {
         }
         if (isAskingAboutScheduleConflict(lastUserText) && courseCodes.length > 0) {
           contextParts.push(
-            courseCodes.map(buildConflictContext).filter(Boolean).join('\n\n---\n\n')
+            courseCodes.map(code => buildConflictContext(code, activeCalendarEvents)).filter(Boolean).join('\n\n---\n\n')
           )
         }
-        if (isAskingAboutCalendar(lastUserText)) {
-          contextParts.push(buildCalendarContext())
+        // Always include calendar context for schedule-related questions
+        const isScheduleQuestion = isAskingAboutCalendar(lastUserText) || 
+            /\b(am i|are you|what.*doing|what.*(am|pm|time)|when.*(am|pm|time)|what.*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun))\b/i.test(lastUserText) ||
+            /\bdoing.*(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b/i.test(lastUserText) ||
+            /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun).*(am|pm|\d+:\d+|\d+\s*(am|pm))\b/i.test(lastUserText)
+        
+        if (isScheduleQuestion) {
+          console.log(`Including calendar context for question: "${lastUserText}"`)
+          contextParts.push(buildCalendarContext(activeCalendarEvents))
         }
 
         // Check if web search is needed

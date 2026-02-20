@@ -24,7 +24,9 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { studentProfile, calendarEvents, getRemainingRequirements, getStudentSkills, type BadgeTier } from '@/lib/data'
+import { studentProfile, getRemainingRequirements, getStudentSkills, type BadgeTier } from '@/lib/data'
+import { useCalendar } from '@/lib/calendar-store'
+import { CalendarUpload } from '@/components/calendar-upload'
 
 const eventTypeIcons: Record<string, React.ReactNode> = {
   work: <Briefcase className="size-3.5" />,
@@ -73,6 +75,7 @@ export function StudentSidebar({ open, onClose }: { open: boolean; onClose: () =
   const skills = getStudentSkills()
   const requirements = getRemainingRequirements()
   const progressPercent = Math.round((studentProfile.totalCredits / studentProfile.requiredCredits) * 100)
+  const { events, importEvents } = useCalendar()
 
   const toggleSection = (section: string) => {
     setExpandedSections(prev => {
@@ -248,9 +251,10 @@ export function StudentSidebar({ open, onClose }: { open: boolean; onClose: () =
             {/* Calendar */}
             <SectionHeader id="calendar" label="Weekly Calendar" icon={<Calendar className="size-3.5" />} />
             {expandedSections.has('calendar') && (
-              <div className="mb-3 flex flex-col gap-1.5">
+              <div className="mb-3 flex flex-col gap-2">
+                <CalendarUpload onImport={importEvents} />
                 {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map(day => {
-                  const dayEvents = calendarEvents.filter(e => e.day === day)
+                  const dayEvents = events.filter(e => e.day === day)
                   if (dayEvents.length === 0) return null
                   return (
                     <div key={day}>

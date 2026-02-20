@@ -9,6 +9,7 @@ import { ChatMessage, WelcomeScreen } from '@/components/chat-messages'
 import { ChatInput } from '@/components/chat-input'
 import { CourseCatalog } from '@/components/course-catalog'
 import { CourseReviewsPanel } from '@/components/course-reviews'
+import { useCalendar } from '@/lib/calendar-store'
 
 const transport = new DefaultChatTransport({ api: '/api/chat' })
 
@@ -18,8 +19,11 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [activeView, setActiveView] = useState<ActiveView>('chat')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const { events: calendarEvents } = useCalendar()
 
-  const { messages, sendMessage, status } = useChat({ transport })
+  const { messages, sendMessage, status } = useChat({
+    transport,
+  })
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -30,7 +34,14 @@ export default function Home() {
   }, [messages, scrollToBottom])
 
   const handleSend = (text: string) => {
-    sendMessage({ text })
+    sendMessage(
+      { text },
+      {
+        body: {
+          calendarEvents: calendarEvents,
+        },
+      }
+    )
   }
 
   const handlePromptClick = (e: React.MouseEvent<HTMLDivElement>) => {

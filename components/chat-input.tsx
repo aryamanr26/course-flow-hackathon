@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef, useEffect } from 'react'
-import { Send, Sparkles } from 'lucide-react'
+import { Send, Sparkles, Paperclip } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 interface ChatInputProps {
@@ -27,6 +27,7 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
   const [input, setInput] = useState('')
   const [isSearching, setIsSearching] = useState(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -68,6 +69,18 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
       <form onSubmit={handleSubmit} className="mx-auto max-w-3xl">
         <div className="relative flex items-center gap-2 rounded-xl border border-border/50 bg-card px-3 py-2 shadow-sm transition-colors focus-within:border-primary/40 focus-within:shadow-md">
           <Sparkles className="size-4 shrink-0 text-primary/50" />
+          <input
+            ref={fileInputRef}
+            type="file"
+            className="hidden"
+            // Placeholder: in the future you can pass this file to the chat API
+            onChange={() => {
+              // For now we just clear the selection; behavior can be wired later
+              if (fileInputRef.current) {
+                fileInputRef.current.value = ''
+              }
+            }}
+          />
           <textarea
             ref={textareaRef}
             value={input}
@@ -79,6 +92,20 @@ export function ChatInput({ onSend, disabled, status }: ChatInputProps) {
             className="flex-1 resize-none bg-transparent text-sm text-foreground placeholder:text-muted-foreground/50 focus:outline-none disabled:opacity-50"
             aria-label="Chat message input"
           />
+          <button
+            type="button"
+            disabled={disabled || isLoading}
+            onClick={() => fileInputRef.current?.click()}
+            className={cn(
+              'flex size-8 shrink-0 items-center justify-center rounded-lg transition-colors border',
+              disabled || isLoading
+                ? 'bg-muted/40 border-border/30 text-muted-foreground/40 cursor-not-allowed'
+                : 'bg-card border-border/60 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
+            )}
+            aria-label="Attach file"
+          >
+            <Paperclip className="size-4" />
+          </button>
           <button
             type="submit"
             disabled={!input.trim() || disabled}
